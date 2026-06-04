@@ -17,7 +17,7 @@ backup_regs_read_byte(const size_t offset, uint8_t *data)
         return -EINVAL;
     }
 
-    ret = bbram_read(backup_regs_dev, offset, sizeof(data), data);
+    ret = bbram_read(backup_regs_dev, offset, 1, data);
     return ret;
 }
 
@@ -30,6 +30,6 @@ backup_regs_write_byte(const size_t offset, const uint8_t data)
         return -EINVAL;
     }
 
-    ret = bbram_write(backup_regs_dev, offset, sizeof(data), &data);
+    ret = bbram_write(backup_regs_dev, offset, 1, &data);
     return ret;
 }

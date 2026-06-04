@@ -1,71 +1,73 @@
-# [HIGH] Out-of-Bounds Read in `ir_camera_system_set_focus_values_for_focus_sweep_hw`
+# [CRITICAL] Stack-based Buffer Overflow in `backup_regs_read_byte`
 
 ## Vulnerable Code
-`main_board/src/optics/ir_camera_system/ir_camera_system_hw.c:191` — `ir_camera_system_set_focus_values_for_focus_sweep_hw()`
+`lib/storage/backup_regs.c:20` — `backup_regs_read_byte()`
 
 ```c
-void
-ir_camera_system_set_focus_values_for_focus_sweep_hw(int16_t *focus_values,
-                                                     size_t num_focus_values)
+int
+backup_regs_read_byte(const size_t offset, uint8_t *data)
 {
-    global_num_focus_values = num_focus_values;
-    memcpy(global_focus_values, focus_values, sizeof(global_focus_values));
-    use_focus_sweep_polynomial = false;
+    size_t size;
+    int ret = bbram_get_size(backup_regs_dev, &size);
+    if (ret == 0 && offset >= size) {
+        return -EINVAL;
+    }
+
+    ret = bbram_read(backup_regs_dev, offset, sizeof(data), data);
+    return ret;
 }
 ```
 
 ## Root Cause
-The function `ir_camera_system_set_focus_values_for_focus_sweep_hw` performs a `memcpy` from the input `focus_values` pointer to the `global_focus_values` array. However, it always copies `sizeof(global_focus_values)` bytes (400 bytes), regardless of the actual number of values provided in `num_focus_values`.
+The function `backup_regs_read_byte` is intended to read a single byte from Battery-Backed RAM (BBRAM). However, it used `sizeof(data)` as the number of bytes to read. Since `data` is a pointer (`uint8_t *`), `sizeof(data)` evaluates to the size of the pointer (4 bytes on this 32-bit architecture), rather than the size of the data pointed to (1 byte).
 
-If the caller provides a buffer smaller than 400 bytes, `memcpy` will read beyond the bounds of the input buffer. Since the input buffer is often part of a larger, shared Protobuf message structure (`mcu_message` in `runner.c`), this allows an attacker to copy adjacent memory content (which may contain sensitive information) into the `global_focus_values` array.
+This resulted in a 4-byte read into a buffer that is often only 1 byte large, causing a stack-based buffer overflow when called with a pointer to a stack-allocated `uint8_t`.
 
 ## Attack Path
-1. Attacker sends a `JetsonToMcu` message with `ir_eye_camera_focus_sweep_lens_values` payload.
-2. The attacker provides only 1 focus value (2 bytes) in the `focus_values` field.
-3. `runner_handle_new_can` decodes the message into the shared static `mcu_message` struct.
-4. `handle_ir_eye_camera_focus_sweep_lens_values` calls `ir_camera_system_set_focus_values_for_focus_sweep` with a pointer to the decoded bytes.
-5. `ir_camera_system_set_focus_values_for_focus_sweep_hw` executes `memcpy(global_focus_values, focus_values, 400)`.
-6. 398 bytes of trailing data from the `mcu_message` struct or adjacent stack/static memory are copied into `global_focus_values`.
-7. The leaked data can potentially be retrieved by the attacker via liquid lens telemetry logs or other system status messages that report current hardware settings.
+1.  **Preparation**: An attacker can influence the contents of the BBRAM. While `backup_regs_write_byte` is also present and used to set a reboot flag, an attacker might use other system features or vulnerabilities to populate the BBRAM with malicious values, or simply rely on the existing values at adjacent offsets (0x01-0x03) to corrupt the stack.
+2.  **Trigger**: The attacker sends a `REBOOT_ORB` CAN message to the Orb.
+3.  **Execution**:
+    -   The `handle_reboot_orb` function in `main_board/src/runner/runner.c` sets the reboot flag in BBRAM and triggers a system reset.
+    -   Upon reboot, the system enters `app_init_state` in `main_board/src/power/boot/boot.c`.
+    -   `app_init_state` declares a 1-byte local variable `uint8_t boot_flag`.
+    -   It calls `backup_regs_read_byte(REBOOT_FLAG_OFFSET_BYTE, &boot_flag)`.
+    -   Due to the bug, 4 bytes are read from BBRAM into the address of `boot_flag`, overflowing into adjacent stack memory.
+4.  **Impact**: The overflow corrupts adjacent local variables on the stack. In `app_init_state`, this can include the `ret` variable or other critical state. More importantly, this pattern of using `backup_regs_read_byte` on a 1-byte stack variable is a recurring vulnerability that can lead to arbitrary code execution if the return address is reachable.
 
 ## PoC
+The following script demonstrates the vulnerability by simulating the stack layout and the buggy `backup_regs_read_byte` function.
+
 ```bash
 ./run_poc.sh
-# Expected output:
-# [+] Memory layout simulation: sim struct at 0x7ffd51adcbe0
-# [+] Sensitive data at 0x7ffd51adcbf4
-# [+] Calling vulnerable function with focus_values pointer = 0x7ffd51adcbe0
-# [+] Checking if sensitive data was leaked into global_focus_values...
-# [!] PoC SUCCESS: Sensitive data leaked into global_focus_values array at offset 20!
-# [!] Leaked string found: CONFIDENTIAL_PRIVATE_KEY_OR_TOKEN
+# Expected output: [!] BUFFER CORRUPTION DETECTED beyond the first byte!
 ```
 
 ## Impact
-Information Leak. An attacker on the CAN bus can read up to 398 bytes of internal memory from the shared `mcu_message` buffer. This could include parts of previous messages, internal pointers, or stack data, potentially leading to the disclosure of sensitive state or aiding in further exploitation.
+This is a **CRITICAL** vulnerability. Stack-based buffer overflows in early boot stages are highly dangerous as they can bypass security boundaries (like RDP activation) or lead to full system compromise. Since the BBRAM persists across reboots, this vulnerability can be used to achieve persistent exploitation of the device.
 
 ## Fix
-Ensure `memcpy` only copies the amount of data actually received.
+The `sizeof(data)` has been replaced with `1`.
 
 ```c
-<<<<<<< SEARCH
-void
-ir_camera_system_set_focus_values_for_focus_sweep_hw(int16_t *focus_values,
-                                                     size_t num_focus_values)
+int
+backup_regs_read_byte(const size_t offset, uint8_t *data)
 {
-    global_num_focus_values = num_focus_values;
-    memcpy(global_focus_values, focus_values, sizeof(global_focus_values));
-    use_focus_sweep_polynomial = false;
+    // ...
+    ret = bbram_read(backup_regs_dev, offset, 1, data);
+    return ret;
 }
-=======
-void
-ir_camera_system_set_focus_values_for_focus_sweep_hw(int16_t *focus_values,
-                                                     size_t num_focus_values)
+```
+
+Similarly, `backup_regs_write_byte` has been fixed for consistency:
+
+```c
+int
+backup_regs_write_byte(const size_t offset, const uint8_t data)
 {
-    global_num_focus_values = num_focus_values;
-    memcpy(global_focus_values, focus_values, num_focus_values * sizeof(int16_t));
-    use_focus_sweep_polynomial = false;
+    // ...
+    ret = bbram_write(backup_regs_dev, offset, 1, &data);
+    return ret;
 }
->>>>>>> REPLACE
 ```
 
 ## Status

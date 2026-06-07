@@ -308,7 +308,8 @@ ir_camera_system_set_focus_values_for_focus_sweep_hw(int16_t *focus_values,
                                                      size_t num_focus_values)
 {
     global_num_focus_values = num_focus_values;
-    memcpy(global_focus_values, focus_values, sizeof(global_focus_values));
+    memcpy(global_focus_values, focus_values,
+           num_focus_values * sizeof(focus_values[0]));
     use_focus_sweep_polynomial = false;
 }
 

